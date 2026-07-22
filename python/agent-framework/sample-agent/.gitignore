@@ -26,3 +26,7 @@ venv/
 
 # Dev tool directories
 /devTools/
+
+
+#Ignore vscode AI rules
+.github\instructions\codacy.instructions.md

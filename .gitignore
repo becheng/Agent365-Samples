@@ -124,3 +124,4 @@ publish/
 # OS-specific files
 .DS_Store
 Thumbs.db
+python/agent-framework/sample-agent/.github/instructions/codacy.instructions.md

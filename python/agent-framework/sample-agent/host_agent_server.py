@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import socket
+import sys
 from os import environ
 
 from aiohttp.web import Application, Request, Response, json_response, run_app
@@ -43,10 +44,11 @@ from microsoft.opentelemetry import use_microsoft_opentelemetry
 from microsoft_agents_a365.observability.core.middleware.baggage_builder import (
     BaggageBuilder,
 )
-from microsoft_agents_a365.runtime.environment_utils import (
-    get_observability_authentication_scope,
+from observability.token_cache import get_cached_token
+from observability.observability_token_service import (
+    acquire_initial_token,
+    run_token_service,
 )
-from token_cache import cache_agentic_token, get_cached_agentic_token
 
 # --- Configuration ---
 ms_agents_logger = logging.getLogger("microsoft_agents")
@@ -60,6 +62,56 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 agents_sdk_config = load_configuration_from_env(environ)
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8")
+
+
+def _get_first_env(*names: str) -> str:
+    for name in names:
+        value = os.getenv(name, "")
+        if value:
+            return value
+    return ""
+
+
+def _get_env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+AGENT365_TENANT_ID = _get_first_env(
+    "AGENT365_TENANT_ID", "AGENT365OBSERVABILITY__TENANTID"
+)
+AGENT365_AGENT_ID = _get_first_env(
+    "AGENT365_AGENT_ID", "AGENT365OBSERVABILITY__AGENTID"
+)
+AGENT365_BLUEPRINT_ID = _get_first_env(
+    "AGENT365_BLUEPRINT_ID", "AGENT365OBSERVABILITY__AGENTBLUEPRINTID"
+)
+AGENT365_CLIENT_ID = _get_first_env(
+    "AGENT365_CLIENT_ID",
+    "AGENT365OBSERVABILITY__CLIENTID",
+    "CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTID",
+)
+AGENT365_CLIENT_SECRET = _get_first_env(
+    "AGENT365_CLIENT_SECRET",
+    "AGENT365OBSERVABILITY__CLIENTSECRET",
+    "CONNECTIONS__SERVICE_CONNECTION__SETTINGS__CLIENTSECRET",
+)
+AGENT365_USE_MANAGED_IDENTITY = _get_env_bool(
+    "AGENT365_USE_MANAGED_IDENTITY", default=False
+)
+AGENT365_S2S_ENABLED = bool(
+    AGENT365_TENANT_ID
+    and AGENT365_AGENT_ID
+    and AGENT365_CLIENT_ID
+    and (AGENT365_USE_MANAGED_IDENTITY or AGENT365_CLIENT_SECRET)
+)
 
 
 # --- Public API ---
@@ -79,8 +131,13 @@ def create_and_run_host(
     use_microsoft_opentelemetry(
         enable_a365=True,
         enable_azure_monitor=False,
-        a365_token_resolver=lambda agent_id, tenant_id: get_cached_agentic_token(
-            tenant_id, agent_id
+        a365_use_s2s_endpoint=True,
+        a365_enable_observability_exporter=AGENT365_S2S_ENABLED,
+        instrumentation_options={
+            "openai_agents": {"enabled": False},
+        },
+        a365_token_resolver=lambda agent_id, tenant_id: get_cached_token(
+            agent_id, tenant_id
         )
         or "",
     )
@@ -113,6 +170,7 @@ class GenericAgentHost:
         self.agent_args = agent_args
         self.agent_kwargs = agent_kwargs
         self.agent_instance = None
+        self._observability_token_task: asyncio.Task | None = None
 
         self.storage = MemoryStorage()
         self.connection_manager = MsalConnectionManager(**agents_sdk_config)
@@ -131,31 +189,39 @@ class GenericAgentHost:
         logger.info("✅ Notification handlers registered successfully")
 
     # --- Observability ---
-    async def _setup_observability_token(
-        self, context: TurnContext, tenant_id: str, agent_id: str
-    ):
-        # Only attempt token exchange when auth handler is configured
-        if not self.auth_handler_name:
-            logger.debug("Skipping observability token exchange (no auth handler)")
+    async def _start_observability_token_service(self):
+        # A365 auth mode: S2S — 3-hop FMI token chain via background token service.
+        if not AGENT365_S2S_ENABLED:
+            logger.warning(
+                "Agent365 S2S observability credentials are incomplete; exporter token service is disabled."
+            )
             return
-            
+
+        if self._observability_token_task is not None:
+            return
+
         try:
-            logger.info(
-                f"🔐 Attempting token exchange for observability... "
-                f"(tenant_id={tenant_id}, agent_id={agent_id})"
-            )
-            exaau_token = await self.agent_app.auth.exchange_token(
-                context,
-                scopes=get_observability_authentication_scope(),
-                auth_handler_id=self.auth_handler_name,
-            )
-            cache_agentic_token(tenant_id, agent_id, exaau_token.token)
-            logger.info(
-                f"✅ Token exchange successful "
-                f"(tenant_id={tenant_id}, agent_id={agent_id})"
+            await acquire_initial_token(
+                tenant_id=AGENT365_TENANT_ID,
+                agent_id=AGENT365_AGENT_ID,
+                blueprint_client_id=AGENT365_CLIENT_ID,
+                blueprint_client_secret=AGENT365_CLIENT_SECRET,
+                use_managed_identity=AGENT365_USE_MANAGED_IDENTITY,
             )
         except Exception as e:
-            logger.warning(f"⚠️ Failed to cache observability token: {e}")
+            logger.warning(
+                f"Initial Agent365 observability token acquisition failed: {e}"
+            )
+
+        self._observability_token_task = asyncio.create_task(
+            run_token_service(
+                tenant_id=AGENT365_TENANT_ID,
+                agent_id=AGENT365_AGENT_ID,
+                blueprint_client_id=AGENT365_CLIENT_ID,
+                blueprint_client_secret=AGENT365_CLIENT_SECRET,
+                use_managed_identity=AGENT365_USE_MANAGED_IDENTITY,
+            )
+        )
 
     async def _validate_agent_and_setup_context(self, context: TurnContext):
         logger.info("🔍 Validating agent and setting up context...")
@@ -168,7 +234,6 @@ class GenericAgentHost:
             await context.send_activity("❌ Sorry, the agent is not available.")
             return None
 
-        await self._setup_observability_token(context, tenant_id, agent_id)
         return tenant_id, agent_id
 
     # --- Handlers (Messages & Notifications) ---
@@ -303,6 +368,7 @@ class GenericAgentHost:
             logger.info(f"🤖 Initializing {self.agent_class.__name__}...")
             self.agent_instance = self.agent_class(*self.agent_args, **self.agent_kwargs)
             await self.agent_instance.initialize()
+            await self._start_observability_token_service()
 
     # --- Authentication ---
     def create_auth_configuration(self) -> AgentAuthConfiguration | None:
@@ -391,25 +457,30 @@ class GenericAgentHost:
                 port = desired_port + 1
 
         print("=" * 80)
-        print(f"🏢 {self.agent_class.__name__}")
+        print(f"Agent: {self.agent_class.__name__}")
         print("=" * 80)
-        print(f"🔒 Auth: {'Enabled' if auth_configuration else 'Anonymous'}")
-        print(f"🚀 Server: localhost:{port}")
-        print(f"📚 Endpoint: http://localhost:{port}/api/messages")
-        print(f"❤️  Health: http://localhost:{port}/api/health\n")
+        print(f"Auth: {'Enabled' if auth_configuration else 'Anonymous'}")
+        print(f"Server: localhost:{port}")
+        print(f"Endpoint: http://localhost:{port}/api/messages")
+        print(f"Health: http://localhost:{port}/api/health\n")
 
         try:
             run_app(app, host="localhost", port=port, handle_signals=True)
         except KeyboardInterrupt:
-            print("\n👋 Server stopped")
+            print("\nServer stopped")
 
     # --- Cleanup ---
     async def cleanup(self):
+        if self._observability_token_task is not None:
+            self._observability_token_task.cancel()
+            try:
+                await self._observability_token_task
+            except asyncio.CancelledError:
+                pass
+            self._observability_token_task = None
+
         if self.agent_instance:
             try:
                 await self.agent_instance.cleanup()
             except Exception as e:
                 logger.error(f"Cleanup error: {e}")
-
-
-

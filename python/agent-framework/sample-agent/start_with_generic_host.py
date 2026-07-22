@@ -20,6 +20,11 @@ except ImportError as e:
 def main():
     """Main entry point - start the generic host with AgentFrameworkAgent"""
     try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8")
+
         print("Starting Generic Agent Host with AgentFrameworkAgent...")
         print()
 
@@ -27,7 +32,7 @@ def main():
         create_and_run_host(AgentFrameworkAgent)
 
     except Exception as e:
-        print(f"❌ Failed to start server: {e}")
+        print(f"Failed to start server: {e}")
         import traceback
 
         traceback.print_exc()
