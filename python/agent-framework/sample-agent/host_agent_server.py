@@ -69,6 +69,49 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 
+def _configure_diagnostic_logging() -> None:
+    verbose_logging = os.getenv("A365_VERBOSE_LOGGING", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    log_level = getattr(logging, log_level_name, logging.INFO)
+    if verbose_logging:
+        log_level = logging.DEBUG
+
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=log_level)
+    logging.getLogger().setLevel(log_level)
+    ms_agents_logger.setLevel(log_level)
+    logger.setLevel(log_level)
+
+    # Keep observability exporter noise reduced unless explicitly debugging.
+    observability_level = logging.INFO if verbose_logging else logging.ERROR
+    observability_logger.setLevel(observability_level)
+
+    httpx_level_name = os.getenv("HTTPX_LOG_LEVEL", "INFO" if verbose_logging else "WARNING").upper()
+    httpx_level = getattr(logging, httpx_level_name, logging.WARNING)
+    logging.getLogger("httpx").setLevel(httpx_level)
+    logging.getLogger("httpcore").setLevel(httpx_level)
+
+    if verbose_logging:
+        logging.getLogger("agent_framework").setLevel(logging.DEBUG)
+        logging.getLogger("mcp").setLevel(logging.DEBUG)
+        logging.getLogger("microsoft_agents_a365.tooling").setLevel(logging.DEBUG)
+
+    logger.info(
+        "Logging configured: LOG_LEVEL=%s, A365_VERBOSE_LOGGING=%s, HTTPX_LOG_LEVEL=%s",
+        logging.getLevelName(log_level),
+        str(verbose_logging).lower(),
+        logging.getLevelName(httpx_level),
+    )
+
+
+_configure_diagnostic_logging()
+
+
 def _get_first_env(*names: str) -> str:
     for name in names:
         value = os.getenv(name, "")
@@ -270,6 +313,14 @@ class GenericAgentHost:
         @self.agent_app.activity("message", **handler_config)
         async def on_message(context: TurnContext, _: TurnState):
             try:
+                async def _send_activity_safe(activity, label: str) -> bool:
+                    try:
+                        await context.send_activity(activity)
+                        return True
+                    except Exception as send_error:
+                        logger.warning("Failed to send %s activity: %s", label, send_error)
+                        return False
+
                 result = await self._validate_agent_and_setup_context(context)
                 if result is None:
                     return
@@ -286,8 +337,8 @@ class GenericAgentHost:
                     # Each send_activity call produces a discrete Teams message.
                     # NOTE: For Teams agentic identities, streaming is buffered into a single message by the SDK;
                     #       use send_activity for any messages that must arrive immediately.
-                    await context.send_activity("Got it — working on it…")
-                    await context.send_activity(Activity(type="typing"))
+                    await _send_activity_safe("Got it — working on it…", "acknowledgment")
+                    await _send_activity_safe(Activity(type="typing"), "initial typing")
 
                     # Typing indicator loop — refreshes the "..." animation every ~4s for long-running operations.
                     # Typing indicators time out after ~5s and must be re-sent. Only visible in 1:1 and small group chats.
@@ -295,26 +346,33 @@ class GenericAgentHost:
                         try:
                             while True:
                                 await asyncio.sleep(4)
-                                await context.send_activity(Activity(type="typing"))
+                                sent = await _send_activity_safe(Activity(type="typing"), "typing")
+                                if not sent:
+                                    break
                         except asyncio.CancelledError:
                             pass  # Expected: loop is cancelled when processing completes.
+                        except Exception as typing_error:
+                            logger.warning("Typing loop stopped due to error: %s", typing_error)
 
                     typing_task = asyncio.create_task(_typing_loop())
                     try:
                         response = await self.agent_instance.process_user_message(
                             user_message, self.agent_app.auth, self.auth_handler_name, context
                         )
-                        await context.send_activity(response)
                     finally:
                         typing_task.cancel()
                         try:
                             await typing_task
                         except asyncio.CancelledError:
                             pass  # Expected on cancel.
+                        except Exception as typing_error:
+                            logger.warning("Typing task shutdown error: %s", typing_error)
+
+                    await _send_activity_safe(response, "response")
 
             except Exception as e:
-                logger.error(f"❌ Error: {e}")
-                await context.send_activity(f"Sorry, I encountered an error: {str(e)}")
+                logger.exception("Message handler error: %s", e)
+                await _send_activity_safe(f"Sorry, I encountered an error: {str(e)}", "error")
 
         @self.agent_notification.on_agent_notification(
             channel_id=ChannelId(channel="agents", sub_channel="*"),
